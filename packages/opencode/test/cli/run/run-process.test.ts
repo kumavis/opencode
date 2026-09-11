@@ -121,9 +121,17 @@ describe("opencode run (non-interactive subprocess)", () => {
           expect(typeof evt.type).toBe("string")
           expect(typeof evt.sessionID).toBe("string")
         }
-        expect(events.map((event) => event.type)).toEqual(["step_start", "text", "step_finish"])
+        expect(events.map((event) => event.type)).toEqual(["step_start", "part_delta", "text", "step_finish"])
         expect(events.map(({ timestamp: _, sessionID: __, ...event }) => event)).toEqual([
           { type: "step_start", part: expect.objectContaining({ type: "step-start" }) },
+          {
+            type: "part_delta",
+            delta: "structured output",
+            field: "text",
+            messageID: expect.any(String),
+            partID: expect.any(String),
+            partType: "text",
+          },
           {
             type: "text",
             part: expect.objectContaining({ type: "text", text: "structured output" }),
@@ -185,13 +193,23 @@ describe("opencode run (non-interactive subprocess)", () => {
         const events = opencode.parseJsonEvents(result.stdout)
         expect(events.map((event) => event.type)).toEqual([
           "step_start",
+          "part_delta",
           "reasoning",
+          "part_delta",
           "text",
           "tool_use",
           "step_finish",
           "step_start",
+          "part_delta",
           "text",
           "step_finish",
+        ])
+        expect(
+          events.filter((event) => event.type === "part_delta").map((event) => [event.partType, event.delta]),
+        ).toEqual([
+          ["reasoning", "reasoning"],
+          ["text", "before"],
+          ["text", "after"],
         ])
         expect(events.find((event) => event.type === "reasoning")?.part).toEqual(
           expect.objectContaining({ type: "reasoning", text: "reasoning" }),
@@ -209,6 +227,38 @@ describe("opencode run (non-interactive subprocess)", () => {
             .slice(0, -1)
             .every((line) => line.startsWith("{")),
         ).toBe(true)
+      }),
+    60_000,
+  )
+
+  // Deltas arrive while a part is still open; the completed `text` /
+  // `reasoning` event still follows, so this stream is additive and existing
+  // consumers keep working. Reasoning deltas respect the `--thinking` gate.
+  cliIt.concurrent(
+    "--format json streams part_delta events attributed by part type",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        yield* llm.push(reply().reason("think ").reason("hard").text("hel").text("lo ").text("world").stop())
+        const thinking = yield* opencode.run("stream deltas", {
+          format: "json",
+          extraArgs: ["--thinking"],
+        })
+        opencode.expectExit(thinking, 0)
+        const deltas = opencode.parseJsonEvents(thinking.stdout).filter((event) => event.type === "part_delta")
+        expect(deltas.map((event) => [event.partType, event.delta])).toEqual([
+          ["reasoning", "think "],
+          ["reasoning", "hard"],
+          ["text", "hel"],
+          ["text", "lo "],
+          ["text", "world"],
+        ])
+
+        yield* llm.reset
+        yield* llm.push(reply().reason("hidden").text("shown").stop())
+        const plain = yield* opencode.run("stream text only", { format: "json" })
+        opencode.expectExit(plain, 0)
+        const plainDeltas = opencode.parseJsonEvents(plain.stdout).filter((event) => event.type === "part_delta")
+        expect(plainDeltas.map((event) => [event.partType, event.delta])).toEqual([["text", "shown"]])
       }),
     60_000,
   )
@@ -231,18 +281,20 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(result.exitCode).toBe(0)
         expect(events.map((event) => event.type)).toEqual([
           "step_start",
+          "part_delta",
           "text",
           "tool_use",
           "step_finish",
           "step_start",
           "step_finish",
           "step_start",
+          "part_delta",
           "text",
           "step_finish",
         ])
-        expect(events[1]?.part).toEqual(expect.objectContaining({ type: "text", text: "partial json" }))
-        expect(events[5]?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "unknown" }))
-        expect(events[7]?.part).toEqual(expect.objectContaining({ type: "text", text: "recovered" }))
+        expect(events[2]?.part).toEqual(expect.objectContaining({ type: "text", text: "partial json" }))
+        expect(events[6]?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "unknown" }))
+        expect(events[9]?.part).toEqual(expect.objectContaining({ type: "text", text: "recovered" }))
         expect(events.at(-1)?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "stop" }))
       }),
     60_000,

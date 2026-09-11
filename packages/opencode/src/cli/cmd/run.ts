@@ -697,6 +697,14 @@ export const RunCommand = effectCmd({
         async function loop(client: OpencodeClient, events: Awaited<ReturnType<typeof sdk.event.subscribe>>) {
           const toggles = new Map<string, boolean>()
           const sessions = new Set([sessionID])
+          // Track partID -> part.type so `message.part.delta` events, which only
+          // carry a partID, can be attributed to the text/reasoning part they
+          // belong to when streamed in --format json.
+          const partTypes = new Map<string, string>()
+          // Compaction summaries are internal session mechanics, not model
+          // output. Their parts, and the synthetic continuation prompt that
+          // follows, must not reach consumers as if the model said them.
+          const compactionMessages = new Set<string>()
           let error: string | undefined
 
           for await (const event of events.stream) {
@@ -717,9 +725,23 @@ export const RunCommand = effectCmd({
               toggles.set("start", true)
             }
 
+            if (
+              event.type === "message.updated" &&
+              event.properties.sessionID === sessionID &&
+              event.properties.info.role === "assistant" &&
+              (event.properties.info.mode === "compaction" || event.properties.info.summary === true)
+            ) {
+              compactionMessages.add(event.properties.info.id)
+            }
+
             if (event.type === "message.part.updated") {
               const part = event.properties.part
               if (part.sessionID !== sessionID) continue
+              // Drop compaction-owned parts before the type map so neither the
+              // completed event nor a later `part_delta` can leak them, and
+              // drop synthetic parts (the compaction continuation prompt).
+              if (compactionMessages.has(part.messageID) || part.synthetic) continue
+              partTypes.set(part.id, part.type)
 
               if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
                 if (emit("tool_use", { part })) continue
@@ -776,6 +798,22 @@ export const RunCommand = effectCmd({
                 }
                 process.stdout.write(line + EOL)
               }
+            }
+
+            // Stream incremental text/reasoning tokens in --format json. The
+            // formatted renderer deliberately waits for the complete part (see
+            // the `part.time?.end` gates above), so this is additive to the
+            // existing `text` / `reasoning` events and only affects JSON
+            // consumers. `part.delta` carries no type of its own, so deltas are
+            // attributed through the partID map and reasoning stays gated on
+            // `--thinking`, matching the complete-part `reasoning` event.
+            if (event.type === "message.part.delta") {
+              const props = event.properties
+              if (props.sessionID !== sessionID) continue
+              const partType = partTypes.get(props.partID)
+              if (partType !== "text" && partType !== "reasoning") continue
+              if (partType === "reasoning" && !thinking) continue
+              if (emit("part_delta", { ...props, partType })) continue
             }
 
             if (event.type === "session.error") {
