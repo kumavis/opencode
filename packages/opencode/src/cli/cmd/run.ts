@@ -25,6 +25,7 @@ import { Filesystem } from "@/util/filesystem"
 import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
+import { isCompactionSummary, isHiddenCompactionPart } from "./run/compaction"
 
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
 
@@ -728,8 +729,7 @@ export const RunCommand = effectCmd({
             if (
               event.type === "message.updated" &&
               event.properties.sessionID === sessionID &&
-              event.properties.info.role === "assistant" &&
-              (event.properties.info.mode === "compaction" || event.properties.info.summary === true)
+              isCompactionSummary(event.properties.info)
             ) {
               compactionMessages.add(event.properties.info.id)
             }
@@ -739,9 +739,9 @@ export const RunCommand = effectCmd({
               if (part.sessionID !== sessionID) continue
               // Drop compaction-owned parts before the type map so neither the
               // completed event nor a later `part_delta` can leak them, and
-              // drop the synthetic compaction continuation prompt.
-              if (compactionMessages.has(part.messageID)) continue
-              if (part.type === "text" && part.synthetic) continue
+              // drop the synthetic compaction continuation prompt. Other
+              // synthetic parts are still forwarded.
+              if (isHiddenCompactionPart(part, compactionMessages)) continue
               partTypes.set(part.id, part.type)
 
               if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
@@ -811,6 +811,7 @@ export const RunCommand = effectCmd({
             if (event.type === "message.part.delta") {
               const props = event.properties
               if (props.sessionID !== sessionID) continue
+              if (props.field !== "text") continue
               const partType = partTypes.get(props.partID)
               if (partType !== "text" && partType !== "reasoning") continue
               if (partType === "reasoning" && !thinking) continue
