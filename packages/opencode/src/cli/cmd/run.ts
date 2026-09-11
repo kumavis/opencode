@@ -739,8 +739,9 @@ export const RunCommand = effectCmd({
               if (part.sessionID !== sessionID) continue
               // Drop compaction-owned parts before the type map so neither the
               // completed event nor a later `part_delta` can leak them, and
-              // drop synthetic parts (the compaction continuation prompt).
-              if (compactionMessages.has(part.messageID) || part.synthetic) continue
+              // drop the synthetic compaction continuation prompt.
+              if (compactionMessages.has(part.messageID)) continue
+              if (part.type === "text" && part.synthetic) continue
               partTypes.set(part.id, part.type)
 
               if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
