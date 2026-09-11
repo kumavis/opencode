@@ -169,6 +169,10 @@ const layer: Layer.Layer<
     })
 
     const find = Effect.fn("Instruction.find")(function* (dir: string) {
+      // `OPENCODE_DISABLE_PROJECT_CONFIG` must also gate nested instructions
+      // discovered on file reads; otherwise a workspace AGENTS.md/CLAUDE.md is
+      // injected during `resolve` even though the top-level scan is disabled.
+      if (Flag.OPENCODE_DISABLE_PROJECT_CONFIG) return undefined
       for (const file of instructionFiles) {
         const filepath = path.resolve(path.join(dir, file))
         if (yield* fs.existsSafe(filepath)) return filepath
