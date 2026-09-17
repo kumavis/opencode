@@ -83,6 +83,33 @@ type CreateInput = {
   location: Location.Ref
 }
 
+/**
+ * One turn of a conversation the caller already has, for `importHistory`.
+ *
+ * Deliberately narrow: dialogue and tool traffic, nothing that could name a
+ * capability or a path. A caller restoring a conversation is describing what
+ * happened, not asking for anything to happen.
+ */
+export type ImportedTurn =
+  | { readonly kind: "user"; readonly text: string }
+  | { readonly kind: "assistant"; readonly text: string }
+  | {
+      readonly kind: "tool"
+      readonly callID: string
+      readonly name: string
+      readonly input: Record<string, unknown>
+      readonly output: string
+      readonly failed?: boolean
+    }
+  | { readonly kind: "compaction"; readonly text: string }
+
+export type ImportHistoryInput = {
+  sessionID: SessionSchema.ID
+  agent: string
+  model: ModelV2.Ref
+  turns: ReadonlyArray<ImportedTurn>
+}
+
 type CompactInput = {
   sessionID: SessionSchema.ID
   prompt?: Prompt
@@ -163,6 +190,25 @@ export interface Interface {
     skill: string
     resume?: boolean
   }) => Effect.Effect<void, OperationUnavailableError>
+  /**
+   * Restore a conversation this session did not have.
+   *
+   * Only into an empty session: an import can establish a history, never
+   * interleave with one, so a live conversation cannot be edited underneath
+   * the model holding it.
+   *
+   * A user turn is imported as a `synthetic` message rather than a prompt.
+   * That is the whole reason this is safe to do from outside: `Prompted`
+   * belongs to the prompt-admission lifecycle and would queue work the runner
+   * executes, so importing through it would make a restored conversation run
+   * itself again. `Synthetic` has exactly one consumer — the projector — and
+   * so describes a turn without provoking one. The assistant-side events used
+   * here are the same: their only consumer is the projector, and the runner
+   * module that names them is their producer.
+   */
+  readonly importHistory: (
+    input: ImportHistoryInput,
+  ) => Effect.Effect<void, NotFoundError | MessageDecodeError | OperationUnavailableError>
   readonly compact: (input: CompactInput) => Effect.Effect<void, NotFoundError | OperationUnavailableError>
   readonly wait: (id: SessionSchema.ID) => Effect.Effect<void, NotFoundError | OperationUnavailableError>
   readonly active: Effect.Effect<ReadonlySet<SessionSchema.ID>>
@@ -389,6 +435,100 @@ const layer = Layer.effect(
       }),
       skill: Effect.fn("V2Session.skill")(function* () {
         return yield* new OperationUnavailableError({ operation: "skill" })
+      }),
+      importHistory: Effect.fn("V2Session.importHistory")(function* (input) {
+        yield* result.get(input.sessionID)
+        const existing = yield* result.messages({ sessionID: input.sessionID })
+        if (existing.length > 0) {
+          // An import establishes a conversation; it never edits one the model
+          // is already holding.
+          return yield* new OperationUnavailableError({ operation: "compact" })
+        }
+        const timestamp = yield* DateTime.now
+        const base = { sessionID: input.sessionID, timestamp }
+        for (const turn of input.turns) {
+          if (turn.kind === "user") {
+            yield* events.publish(SessionEvent.Synthetic, {
+              ...base,
+              messageID: SessionMessage.ID.create(),
+              text: turn.text,
+            })
+            continue
+          }
+          if (turn.kind === "compaction") {
+            yield* events.publish(SessionEvent.ContextUpdated, {
+              ...base,
+              messageID: SessionMessage.ID.create(),
+              text: turn.text,
+            })
+            continue
+          }
+          // Every assistant-side turn needs a message to hang content on.
+          const assistantMessageID = SessionMessage.ID.create()
+          yield* events.publish(SessionEvent.Step.Started, {
+            ...base,
+            assistantMessageID,
+            agent: input.agent,
+            model: input.model,
+          })
+          if (turn.kind === "assistant") {
+            const textID = SessionMessage.ID.create()
+            yield* events.publish(SessionEvent.Text.Started, {
+              ...base,
+              assistantMessageID,
+              textID,
+            })
+            yield* events.publish(SessionEvent.Text.Ended, {
+              ...base,
+              assistantMessageID,
+              textID,
+              text: turn.text,
+            })
+          } else {
+            const provider = { executed: true }
+            yield* events.publish(SessionEvent.Tool.Called, {
+              ...base,
+              assistantMessageID,
+              callID: turn.callID,
+              tool: turn.name,
+              input: turn.input,
+              provider,
+            })
+            const content = [{ type: "text" as const, text: turn.output }]
+            if (turn.failed) {
+              // `Tool.Failed` carries the error rather than content: a failed
+              // call's output is the failure.
+              yield* events.publish(SessionEvent.Tool.Failed, {
+                ...base,
+                assistantMessageID,
+                callID: turn.callID,
+                error: { type: "unknown" as const, message: turn.output },
+                provider,
+              })
+            } else {
+              yield* events.publish(SessionEvent.Tool.Success, {
+                ...base,
+                assistantMessageID,
+                callID: turn.callID,
+                structured: {},
+                content,
+                provider,
+              })
+            }
+          }
+          yield* events.publish(SessionEvent.Step.Ended, {
+            ...base,
+            assistantMessageID,
+            finish: "stop",
+            cost: 0,
+            tokens: {
+              input: 0,
+              output: 0,
+              reasoning: 0,
+              cache: { read: 0, write: 0 },
+            },
+          })
+        }
       }),
       switchAgent: Effect.fn("V2Session.switchAgent")(function* (input) {
         yield* result.get(input.sessionID)

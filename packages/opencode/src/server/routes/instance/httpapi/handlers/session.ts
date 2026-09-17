@@ -5,6 +5,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Command } from "@/command"
 import { Permission } from "@/permission"
 import { SessionShare } from "@/share/session"
+import { SessionV2 } from "@opencode-ai/core/session"
 import { Session } from "@/session/session"
 import { SessionCompaction } from "@/session/compaction"
 import { MessageV2 } from "@/session/message-v2"
@@ -32,11 +33,12 @@ import {
   PermissionResponsePayload,
   PromptPayload,
   RevertPayload,
+  ImportPayload,
   ShellPayload,
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError } from "../errors"
+import { PermissionNotFoundError, notFound } from "../errors"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
@@ -58,6 +60,11 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const statusSvc = yield* SessionStatus.Service
     const todoSvc = yield* Todo.Service
     const summary = yield* SessionSummary.Service
+    // The import reaches the v2 service directly. The v1 wrapper above is a
+    // compatibility surface over a parallel implementation and does not
+    // delegate to v2, so routing an import through it would mean a second
+    // implementation of the same thing.
+    const sessionV2 = yield* SessionV2.Service
     const events = yield* EventV2Bridge.Service
     const scope = yield* Scope.Scope
 
@@ -101,6 +108,30 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       query: typeof DiffQuery.Type
     }) {
       return yield* summary.diff({ sessionID: ctx.params.sessionID, messageID: ctx.query.messageID })
+    })
+
+    const importHistory = Effect.fn("SessionHttpApi.importHistory")(function* (ctx: {
+      params: { sessionID: SessionID }
+      payload: typeof ImportPayload.Type
+    }) {
+      // An unknown session is a 404; a session that already has messages, or
+      // a history this store cannot decode, is a request that cannot be
+      // honoured rather than one addressed to the wrong place.
+      yield* sessionV2
+        .importHistory({
+          sessionID: ctx.params.sessionID,
+          agent: ctx.payload.agent,
+          model: ctx.payload.model,
+          turns: ctx.payload.turns,
+        })
+        .pipe(
+          Effect.mapError((error) =>
+            error instanceof SessionV2.NotFoundError
+              ? notFound(`Session not found: ${error.sessionID}`)
+              : new HttpApiError.BadRequest({}),
+          ),
+        )
+      return true
     })
 
     const messages = Effect.fn("SessionHttpApi.messages")(function* (ctx: {
@@ -417,6 +448,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("children", children)
       .handle("todo", todo)
       .handle("diff", diff)
+      .handle("importHistory", importHistory)
       .handle("messages", messages)
       .handle("message", message)
       .handleRaw("create", createRaw)

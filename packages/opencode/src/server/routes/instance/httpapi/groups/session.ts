@@ -57,6 +57,33 @@ export const UpdatePayload = Schema.Struct({
   ),
 })
 export const ForkPayload = Schema.Struct(Struct.omit(Session.ForkInput.fields, ["sessionID"]))
+/**
+ * A conversation the caller already holds, for `session.importHistory`.
+ *
+ * Dialogue and tool traffic only — nothing that could name a capability or a
+ * path. A caller restoring a conversation is describing what happened, not
+ * asking for anything to happen.
+ */
+export const ImportedTurn = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("user"), text: Schema.String }),
+  Schema.Struct({ kind: Schema.Literal("assistant"), text: Schema.String }),
+  Schema.Struct({
+    kind: Schema.Literal("tool"),
+    callID: Schema.String,
+    name: Schema.String,
+    input: Schema.Record(Schema.String, Schema.Unknown),
+    output: Schema.String,
+    failed: Schema.optional(Schema.Boolean),
+  }),
+  Schema.Struct({ kind: Schema.Literal("compaction"), text: Schema.String }),
+]).pipe(Schema.toTaggedUnion("kind"))
+
+export const ImportPayload = Schema.Struct({
+  agent: Schema.String,
+  model: ModelV2.Ref,
+  turns: Schema.Array(ImportedTurn),
+})
+
 export const InitPayload = Schema.Struct({
   modelID: ModelV2.ID,
   providerID: ProviderV2.ID,
@@ -102,6 +129,7 @@ export const SessionPaths = {
   deleteMessage: `${root}/:sessionID/message/:messageID`,
   deletePart: `${root}/:sessionID/message/:messageID/part/:partID`,
   updatePart: `${root}/:sessionID/message/:messageID/part/:partID`,
+  importHistory: `${root}/:sessionID/message/import`,
 } as const
 
 export const SessionApi = HttpApi.make("session")
@@ -248,6 +276,20 @@ export const SessionApi = HttpApi.make("session")
             identifier: "session.fork",
             summary: "Fork session",
             description: "Create a new session by forking an existing session at a specific message point.",
+          }),
+        ),
+        HttpApiEndpoint.post("importHistory", SessionPaths.importHistory, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: ImportPayload,
+          success: described(Schema.Boolean, "Imported"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.importHistory",
+            summary: "Import conversation history",
+            description:
+              "Restore a conversation this session did not have. Only into a session with no messages: an import establishes a history, it never interleaves with one. User turns are recorded as synthetic messages rather than prompts, so an imported conversation is described without being run.",
           }),
         ),
         HttpApiEndpoint.post("abort", SessionPaths.abort, {
