@@ -5,7 +5,6 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Command } from "@/command"
 import { Permission } from "@/permission"
 import { SessionShare } from "@/share/session"
-import { SessionV2 } from "@opencode-ai/core/session"
 import { Session } from "@/session/session"
 import { SessionCompaction } from "@/session/compaction"
 import { MessageV2 } from "@/session/message-v2"
@@ -16,6 +15,8 @@ import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
 import { Todo } from "@/session/todo"
 import { MessageID, PartID, SessionID } from "@/session/schema"
+import { Database } from "@opencode-ai/core/database/database"
+import { MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Effect, Option, Schema, Scope } from "effect"
 import * as Stream from "effect/Stream"
@@ -38,7 +39,7 @@ import {
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError, notFound } from "../errors"
+import { PermissionNotFoundError } from "../errors"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
@@ -60,11 +61,6 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const statusSvc = yield* SessionStatus.Service
     const todoSvc = yield* Todo.Service
     const summary = yield* SessionSummary.Service
-    // The import reaches the v2 service directly. The v1 wrapper above is a
-    // compatibility surface over a parallel implementation and does not
-    // delegate to v2, so routing an import through it would mean a second
-    // implementation of the same thing.
-    const sessionV2 = yield* SessionV2.Service
     const events = yield* EventV2Bridge.Service
     const scope = yield* Scope.Scope
 
@@ -110,27 +106,110 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return yield* summary.diff({ sessionID: ctx.params.sessionID, messageID: ctx.query.messageID })
     })
 
+    /**
+     * Restore a conversation into the store this instance actually reads.
+     *
+     * Rows go straight into `MessageTable` and `PartTable`, which is what
+     * `cli/cmd/import.ts` does to bring a shared session onto a machine. This
+     * route is that command's HTTP sibling, and it writes where the prompt
+     * path reads: `Session.messages` and every turn go through `MessageV2`
+     * over those tables. The v2 service keeps a parallel store of its own that
+     * nothing here consults, so publishing v2 events would commit, project,
+     * and remain invisible to the model.
+     *
+     * Nothing in the payload can name a capability or a path: dialogue text,
+     * and a tool call's name, input and output. A caller restoring a
+     * conversation is describing what happened, not asking for anything to
+     * happen — no prompt is admitted and no turn is queued.
+     */
     const importHistory = Effect.fn("SessionHttpApi.importHistory")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof ImportPayload.Type
     }) {
-      // An unknown session is a 404; a session that already has messages, or
-      // a history this store cannot decode, is a request that cannot be
-      // honoured rather than one addressed to the wrong place.
-      yield* sessionV2
-        .importHistory({
-          sessionID: ctx.params.sessionID,
-          agent: ctx.payload.agent,
-          model: ctx.payload.model,
-          turns: ctx.payload.turns,
+      const { db } = yield* Database.Service
+      const sessionID = ctx.params.sessionID
+      const info = yield* requireSession(sessionID)
+      // An import establishes a history; it never interleaves with one, so a
+      // conversation the model is already holding cannot be edited underneath
+      // it.
+      const existing = yield* SessionError.mapStorageNotFound(session.messages({ sessionID }))
+      if (existing.length > 0) return yield* new HttpApiError.BadRequest({})
+
+      const created = Date.now()
+      const modelID = ctx.payload.model.id
+      const providerID = ctx.payload.model.providerID
+      const agent = ctx.payload.agent
+      let parentID: MessageID | undefined
+
+      const insertMessage = (id: MessageID, data: Record<string, unknown>) =>
+        db
+          .insert(MessageTable)
+          .values({ id, session_id: sessionID, time_created: created, data: data as never })
+          .onConflictDoNothing()
+          .run()
+          .pipe(Effect.orDie)
+      const insertPart = (id: PartID, messageID: MessageID, data: Record<string, unknown>) =>
+        db
+          .insert(PartTable)
+          .values({ id, message_id: messageID, session_id: sessionID, data: data as never })
+          .onConflictDoNothing()
+          .run()
+          .pipe(Effect.orDie)
+
+      for (const turn of ctx.payload.turns) {
+        const messageID = MessageID.ascending()
+        if (turn.kind === "user" || turn.kind === "compaction") {
+          yield* insertMessage(messageID, {
+            role: "user",
+            time: { created },
+            agent,
+            model: { providerID, modelID },
+          })
+          yield* insertPart(PartID.ascending(), messageID, {
+            type: "text",
+            text: turn.text,
+            // A compaction boundary is context the model is given rather than
+            // something the user typed.
+            ...(turn.kind === "compaction" ? { synthetic: true } : {}),
+          })
+          parentID = messageID
+          continue
+        }
+        // Assistant-side turns need a message to hang their parts on, and the
+        // assistant row carries the accounting fields the store requires. They
+        // are zero here on purpose: this conversation was paid for in the
+        // incarnation that first ran it, and counting it again would report
+        // spend that never happened.
+        yield* insertMessage(messageID, {
+          role: "assistant",
+          time: { created, completed: created },
+          parentID: parentID ?? messageID,
+          modelID,
+          providerID,
+          mode: agent,
+          agent,
+          path: { cwd: info.directory, root: info.directory },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
         })
-        .pipe(
-          Effect.mapError((error) =>
-            error instanceof SessionV2.NotFoundError
-              ? notFound(`Session not found: ${error.sessionID}`)
-              : new HttpApiError.BadRequest({}),
-          ),
-        )
+        if (turn.kind === "assistant") {
+          yield* insertPart(PartID.ascending(), messageID, { type: "text", text: turn.text })
+        } else {
+          yield* insertPart(PartID.ascending(), messageID, {
+            type: "tool",
+            callID: turn.callID,
+            tool: turn.name,
+            state: {
+              status: "completed",
+              input: turn.input,
+              output: turn.output,
+              title: turn.name,
+              metadata: {},
+              time: { start: created, end: created },
+            },
+          })
+        }
+      }
       return true
     })
 
