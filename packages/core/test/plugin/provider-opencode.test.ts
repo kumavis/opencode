@@ -183,6 +183,10 @@ describe("OpencodePlugin", () => {
                           limit: { context: 1000, output: 100 },
                         },
                         disabled: { name: "Disabled", status: "deprecated" },
+                        "context-only": { limit: { context: 64000 } },
+                        "output-only": { limit: { output: 4096 } },
+                        "input-only": { limit: { input: 32000 } },
+                        "empty-limit": { limit: {} },
                       },
                     },
                   },
@@ -199,6 +203,11 @@ describe("OpencodePlugin", () => {
           yield* catalog.transform((draft) => {
             draft.provider.update(ProviderV2.ID.make("remote"), () => {})
             draft.model.update(ProviderV2.ID.make("remote"), ModelV2.ID.make("stale"), () => {})
+            for (const id of ["context-only", "output-only", "input-only", "empty-limit"]) {
+              draft.model.update(ProviderV2.ID.make("remote"), ModelV2.ID.make(id), (model) => {
+                model.limit = { context: 128000, input: 96000, output: 8192 }
+              })
+            }
           })
           yield* credentials.create({
             integrationID: Integration.ID.make("opencode"),
@@ -251,6 +260,16 @@ describe("OpencodePlugin", () => {
             required(yield* catalog.model.get(ProviderV2.ID.make("remote"), ModelV2.ID.make("disabled"))).enabled,
           ).toBe(false)
           expect(yield* catalog.model.get(ProviderV2.ID.make("remote"), ModelV2.ID.make("stale"))).toBeDefined()
+          for (const [id, limit] of [
+            ["context-only", { context: 64000, input: 96000, output: 8192 }],
+            ["output-only", { context: 128000, input: 96000, output: 4096 }],
+            ["input-only", { context: 128000, input: 32000, output: 8192 }],
+            ["empty-limit", { context: 128000, input: 96000, output: 8192 }],
+          ] as const) {
+            expect(required(yield* catalog.model.get(ProviderV2.ID.make("remote"), ModelV2.ID.make(id))).limit).toEqual(
+              limit,
+            )
+          }
           expect(authorization).toContain("Bearer secret")
         }),
       ({ server }) => Effect.promise(() => server.stop(true)),

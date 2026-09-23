@@ -166,7 +166,13 @@ export const OpencodePlugin = define<HttpClient.HttpClient | EventV2.Service | S
             }
             model.status = config.status ?? "active"
             model.enabled = config.status !== "deprecated"
-            if (config.limit !== undefined) model.limit = { ...config.limit }
+            if (config.limit !== undefined) {
+              model.limit = {
+                context: config.limit.context ?? model.limit.context,
+                input: config.limit.input ?? model.limit.input,
+                output: config.limit.output ?? model.limit.output,
+              }
+            }
           })
         }
       }
