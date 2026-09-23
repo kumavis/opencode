@@ -10,6 +10,7 @@ import * as Stream from "effect/Stream"
 import { Config } from "@/config/config"
 import { LLM } from "../../src/session/llm"
 import { SessionCompaction } from "../../src/session/compaction"
+import { isOverflow, usable } from "../../src/session/overflow"
 import { Token } from "@/util/token"
 import { Plugin } from "../../src/plugin"
 import { provideTmpdirInstance, TestInstance } from "../fixture/fixture"
@@ -395,6 +396,54 @@ function compactionContext(context: string) {
     init: () => Effect.void,
   })
 }
+
+describe("session.compaction.usable constraints", () => {
+  test("a retained input limit cannot override a smaller observed context", () => {
+    const model = createModel({ context: 123_456, input: 200_000, output: 8000 })
+    const cfg = {}
+    expect(usable({ cfg, model, outputTokenMax: 8192 })).toBe(115_456)
+    expect(
+      isOverflow({
+        cfg,
+        model,
+        outputTokenMax: 8192,
+        tokens: { input: 115_455, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      }),
+    ).toBe(false)
+    expect(
+      isOverflow({
+        cfg,
+        model,
+        outputTokenMax: 8192,
+        tokens: { input: 115_456, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      }),
+    ).toBe(true)
+  })
+
+  test("a smaller input limit and custom reservation still constrain context", () => {
+    const model = createModel({ context: 200_000, input: 100_000, output: 8000 })
+    expect(usable({ cfg: {}, model })).toBe(92_000)
+    expect(usable({ cfg: { compaction: { reserved: 12_000 } }, model })).toBe(88_000)
+    expect(usable({ cfg: { compaction: { reserved: 0 } }, model })).toBe(100_000)
+    expect(usable({ cfg: { compaction: { reserved: 300_000 } }, model })).toBe(0)
+  })
+
+  test("zero reservation cannot remove room for output from the context window", () => {
+    const model = createModel({ context: 100_000, input: 200_000, output: 32_000 })
+    expect(usable({ cfg: { compaction: { reserved: 0 } }, model, outputTokenMax: 8192 })).toBe(91_808)
+    expect(usable({ cfg: {}, model, outputTokenMax: 4096 })).toBe(95_904)
+    expect(
+      usable({ cfg: {}, model: createModel({ context: 100_000, input: 200_000, output: 0 }), outputTokenMax: 8192 }),
+    ).toBe(91_808)
+  })
+
+  test("unknown context and exhausted windows retain their zero boundary", () => {
+    expect(usable({ cfg: {}, model: createModel({ context: 0, input: 200_000, output: 8000 }) })).toBe(0)
+    expect(usable({ cfg: {}, model: createModel({ context: 1000, input: 200_000, output: 8000 }) })).toBe(0)
+    expect(usable({ cfg: {}, model: createModel({ context: 100_000, input: 1000, output: 8000 }) })).toBe(0)
+    expect(usable({ cfg: {}, model: createModel({ context: 100_000, output: 8000 }) })).toBe(92_000)
+  })
+})
 
 describe("session.compaction.isOverflow", () => {
   it.live(

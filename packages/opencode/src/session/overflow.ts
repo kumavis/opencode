@@ -11,12 +11,13 @@ export function usable(input: { cfg: ConfigV1.Info; model: Provider.Model; outpu
   const context = input.model.limit.context
   if (context === 0) return 0
 
-  const reserved =
-    input.cfg.compaction?.reserved ??
-    Math.min(COMPACTION_BUFFER, ProviderTransform.maxOutputTokens(input.model, input.outputTokenMax))
+  const output = ProviderTransform.maxOutputTokens(input.model, input.outputTokenMax)
+  const reserved = input.cfg.compaction?.reserved ?? Math.min(COMPACTION_BUFFER, output)
+  // A bundled input limit can survive a newer, smaller context observation.
+  // Both constraints apply; input headroom must never exceed context headroom.
   return input.model.limit.input
-    ? Math.max(0, input.model.limit.input - reserved)
-    : Math.max(0, context - ProviderTransform.maxOutputTokens(input.model, input.outputTokenMax))
+    ? Math.max(0, Math.min(input.model.limit.input - reserved, context - output))
+    : Math.max(0, context - output)
 }
 
 export function isOverflow(input: {
