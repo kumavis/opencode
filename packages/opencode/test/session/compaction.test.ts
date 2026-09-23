@@ -2,6 +2,7 @@ import { afterEach, describe, expect, mock, test } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
+import { MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { APICallError } from "ai"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
@@ -51,6 +52,22 @@ const ref = {
 const usage = (input: ConstructorParameters<typeof Usage>[0]) => new Usage(input)
 
 const basicUsage = () => usage({ inputTokens: 1, outputTokens: 1, totalTokens: 2 })
+
+test("checkpoint bounds count UTF-8 bytes and reject rather than truncate", () => {
+  const id = MessageID.ascending()
+  const sessionID = SessionID.create()
+  const part: SessionV1.TextPart = { id: PartID.ascending(), messageID: id, sessionID, type: "text", text: "" }
+  const message: SessionV1.WithParts = {
+    info: { id, sessionID, role: "user", time: { created: 0 }, agent: "build", model: ref },
+    parts: [part],
+  }
+  const overhead = Buffer.byteLength(JSON.stringify(SessionCompaction.makeCheckpoint(id, [message])), "utf8")
+  part.text = "x".repeat(SessionCompaction.MAX_CHECKPOINT_BYTES - overhead)
+  expect(SessionCompaction.makeCheckpoint(id, [message]).messages[0]).toBe(message)
+  part.text += "é"
+  expect(() => SessionCompaction.makeCheckpoint(id, [message])).toThrow("16 MiB transport limit")
+  expect(part.text.endsWith("é")).toBe(true)
+})
 
 afterEach(() => {
   mock.restore()
@@ -933,6 +950,110 @@ describe("session.compaction.process", () => {
         expect(last.parts[0].text).toContain("Continue if you have next steps")
       }
     }),
+  )
+
+  it.instance(
+    "reports checkpoint failure before returning to the runner's idle transition",
+    Effect.gen(function* () {
+      const ssn = yield* SessionNs.Service
+      const events = yield* EventV2Bridge.Service
+      const session = yield* ssn.create({})
+      const message = yield* createUserMessage(session.id, "x".repeat(SessionCompaction.MAX_CHECKPOINT_BYTES))
+      const messages = yield* ssn.messages({ sessionID: session.id })
+      const seen: string[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type === SessionNs.Event.Error.type) {
+          const data = Schema.decodeUnknownSync(SessionNs.Event.Error.data)(event.data)
+          if (data.sessionID === session.id && data.error?.name === "UnknownError") seen.push(data.error.data.message)
+        }
+        if (event.type === SessionCompaction.Event.Compacted.type) seen.push("compacted")
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => off)
+      expect(
+        yield* SessionCompaction.use.process({ parentID: message.id, messages, sessionID: session.id, auto: false }),
+      ).toBe("stop")
+      seen.push("returned")
+      expect(seen).toEqual(["Unable to publish compaction checkpoint", "returned"])
+    }),
+  )
+
+  itCompaction.instance(
+    "publishes authoritative retained context including history imported without events",
+    () => {
+      const stub = llm()
+      stub.push(reply("checkpoint summary"))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const events = yield* EventV2Bridge.Service
+        const database = yield* Database.Service
+        const session = yield* ssn.create({})
+        const old = yield* createUserMessage(session.id, "superseded")
+        const kept = MessageID.ascending()
+        const created = Date.now()
+        const imported: Omit<SessionV1.User, "id" | "sessionID"> = {
+          role: "user",
+          time: { created },
+          agent: "build",
+          model: ref,
+        }
+        const part: Omit<SessionV1.TextPart, "id" | "sessionID" | "messageID"> = {
+          type: "text",
+          text: "imported retained request",
+        }
+        // Same direct legacy-table write boundary as the import endpoint;
+        // an SSE-only mirror cannot observe these rows.
+        yield* database.db
+          .insert(MessageTable)
+          .values({
+            id: kept,
+            session_id: session.id,
+            time_created: created,
+            data: imported,
+          })
+          .run()
+          .pipe(Effect.orDie)
+        yield* database.db
+          .insert(PartTable)
+          .values({
+            id: PartID.ascending(),
+            message_id: kept,
+            session_id: session.id,
+            data: part,
+          })
+          .run()
+          .pipe(Effect.orDie)
+        yield* createSummaryCompaction(session.id)
+        const messages = yield* ssn.messages({ sessionID: session.id })
+        const parent = messages.at(-1)!.info.id
+        const captured = yield* Deferred.make<typeof SessionCompaction.Event.Compacted.data.Type>()
+        const off = yield* events.listen((event) => {
+          if (event.type !== SessionCompaction.Event.Compacted.type) return Effect.void
+          const data = Schema.decodeUnknownSync(SessionCompaction.Event.Compacted.data)(event.data)
+          if (data.sessionID !== session.id) return Effect.void
+          return Deferred.succeed(captured, data)
+        })
+        yield* Effect.addFinalizer(() => off)
+        expect(
+          yield* SessionCompaction.use.process({ parentID: parent, messages, sessionID: session.id, auto: true }),
+        ).toBe("continue")
+        const data = yield* Deferred.await(captured).pipe(Effect.timeout("2 seconds"))
+        const checkpoint = data.checkpoint!
+        expect(checkpoint.version).toBe(1)
+        const active = MessageV2.filterCompacted((yield* ssn.messages({ sessionID: session.id })).toReversed())
+        expect(checkpoint.messages).toEqual(active)
+        expect(checkpoint.messages.some((message) => message.info.id === old.id)).toBe(false)
+        expect(checkpoint.messages.some((message) => message.info.id === kept)).toBe(true)
+        expect(checkpoint.messages[1]?.info.id).toBe(checkpoint.summaryID)
+        expect(checkpoint.messages.at(-1)?.parts[0]).toMatchObject({
+          type: "text",
+          metadata: { compaction_continue: true },
+        })
+        yield* createUserMessage(session.id, "after checkpoint")
+        expect(JSON.stringify(checkpoint)).not.toContain("after checkpoint")
+      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 10_000 }) }))
+    },
+    { git: true },
   )
 
   itCompaction.instance(

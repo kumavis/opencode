@@ -1540,6 +1540,14 @@ export type GlobalEvent = {
         type: "session.compacted"
         properties: {
           sessionID: string
+          checkpoint?: {
+            version: 1
+            summaryID: string
+            messages: Array<{
+              info: Message
+              parts: Array<Part>
+            }>
+          }
         }
       }
     | {
@@ -5967,6 +5975,14 @@ export type SessionCompacted = {
   location?: LocationRef
   data: {
     sessionID: string
+    checkpoint?: {
+      version: 1
+      summaryID: string
+      messages: Array<{
+        info: Message
+        parts: Array<Part>
+      }>
+    }
   }
 }
 
@@ -6986,6 +7002,14 @@ export type EventSessionCompacted = {
   type: "session.compacted"
   properties: {
     sessionID: string
+    checkpoint?: {
+      version: 1
+      summaryID: string
+      messages: Array<{
+        info: Message
+        parts: Array<Part>
+      }>
+    }
   }
 }
 
@@ -9958,6 +9982,67 @@ export type SessionForkResponses = {
 }
 
 export type SessionForkResponse = SessionForkResponses[keyof SessionForkResponses]
+
+export type SessionImportHistoryData = {
+  body?: {
+    agent: string
+    model: ModelRef
+    turns: Array<
+      | {
+          kind: "user"
+          text: string
+        }
+      | {
+          kind: "assistant"
+          text: string
+        }
+      | {
+          kind: "tool"
+          callID: string
+          name: string
+          input: {
+            [key: string]: unknown
+          }
+          output: string
+          failed?: boolean
+        }
+      | {
+          kind: "compaction"
+          text: string
+        }
+    >
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/message/import"
+}
+
+export type SessionImportHistoryErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionImportHistoryError = SessionImportHistoryErrors[keyof SessionImportHistoryErrors]
+
+export type SessionImportHistoryResponses = {
+  /**
+   * Imported
+   */
+  200: boolean
+}
+
+export type SessionImportHistoryResponse = SessionImportHistoryResponses[keyof SessionImportHistoryResponses]
 
 export type SessionAbortData = {
   body?: never

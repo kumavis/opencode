@@ -193,6 +193,8 @@ import type {
   SessionForkResponses,
   SessionGetErrors,
   SessionGetResponses,
+  SessionImportHistoryErrors,
+  SessionImportHistoryResponses,
   SessionInitErrors,
   SessionInitResponses,
   SessionListErrors,
@@ -3895,6 +3897,76 @@ export class Session2 extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<SessionForkResponses, SessionForkErrors, ThrowOnError>({
       url: "/session/{sessionID}/fork",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Import conversation history
+   *
+   * Restore a conversation this session did not have. Only into a session with no messages: an import establishes a history, it never interleaves with one. User turns are recorded as synthetic messages rather than prompts, so an imported conversation is described without being run.
+   */
+  public importHistory<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      agent?: string
+      model?: ModelRef
+      turns?: Array<
+        | {
+            kind: "user"
+            text: string
+          }
+        | {
+            kind: "assistant"
+            text: string
+          }
+        | {
+            kind: "tool"
+            callID: string
+            name: string
+            input: {
+              [key: string]: unknown
+            }
+            output: string
+            failed?: boolean
+          }
+        | {
+            kind: "compaction"
+            text: string
+          }
+      >
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "agent" },
+            { in: "body", key: "model" },
+            { in: "body", key: "turns" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      SessionImportHistoryResponses,
+      SessionImportHistoryErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/message/import",
       ...options,
       ...params,
       headers: {

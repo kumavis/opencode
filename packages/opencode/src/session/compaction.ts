@@ -22,8 +22,21 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
+import { NamedError } from "@opencode-ai/core/util/error"
 
 export const Event = SessionCompactionEvent
+
+// Bound the additional event payload; never truncate retained context silently.
+// Consumers must also bound their framing and reject unsupported checkpoints.
+export const MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
+
+export function makeCheckpoint(summaryID: MessageID, messages: SessionV1.WithParts[]) {
+  const checkpoint = { version: 1 as const, summaryID, messages }
+  if (Buffer.byteLength(JSON.stringify(checkpoint), "utf8") > MAX_CHECKPOINT_BYTES) {
+    throw new Error("Compaction checkpoint exceeds the 16 MiB transport limit")
+  }
+  return checkpoint
+}
 
 export const PRUNE_MINIMUM = 20_000
 export const PRUNE_PROTECT = 40_000
@@ -551,7 +564,31 @@ const layer = Layer.effect(
 
       if (processor.message.error) return "stop"
       if (result === "continue") {
-        yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
+        // Read the authoritative store: imported history is inserted directly
+        // and is not observable as message/part events. Publish this immutable
+        // cut before returning to the prompt loop, so a consumer never races a
+        // later model step by fetching history after the notification.
+        const published = yield* Effect.gen(function* () {
+          const current = yield* session.messages({ sessionID: input.sessionID })
+          yield* events.publish(Event.Compacted, {
+            sessionID: input.sessionID,
+            checkpoint: makeCheckpoint(msg.id, MessageV2.filterCompacted(current.toReversed())),
+          })
+          return true
+        }).pipe(
+          Effect.catchCause(() =>
+            Effect.gen(function* () {
+              // The runner emits idle before promptAsync's outer error handler.
+              // Report failure here, before returning, without context content.
+              yield* events.publish(Session.Event.Error, {
+                sessionID: input.sessionID,
+                error: new NamedError.Unknown({ message: "Unable to publish compaction checkpoint" }).toObject(),
+              })
+              return false
+            }),
+          ),
+        )
+        if (!published) return "stop"
       }
       return result
     })
